@@ -1,0 +1,33 @@
+﻿# Keil build outputs
+*.o
+*.d
+*.crf
+*.htm
+*.dep
+*.iex
+*.sct
+*.map
+*.bak
+*.lst
+*.lnp
+*.axf
+*.build_log.htm
+*.uvguix.*
+*.uvoptx
+\_\_i
+JLinkLog.txt
+JLinkSettings.ini
+*.jlink
+DebugConfig/
+Debug/
+Listings/
+Objects/
+RTE/
+\_history/
+*.scvd
+*.uvmpw
+*.uvpjx
+
+# Large files
+**/video.mp4
+**/*.mp4
