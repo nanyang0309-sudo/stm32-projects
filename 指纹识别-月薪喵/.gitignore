@@ -1,0 +1,25 @@
+# Keil MDK-ARM
+Objects/
+Listings/
+DebugConfig/
+*.uvguix.*
+*.uvoptx
+*.scvd
+*.crf
+*.d
+*.o
+*.axf
+*.hex
+*.htm
+*.lnp
+*.dep
+*.map
+*.lst
+*.build_log.htm
+
+# IDE
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
