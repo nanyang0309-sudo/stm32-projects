@@ -1,82 +1,509 @@
 #include "stm32f10x.h"
+#include "stm32f10x_bkp.h"
+#include "stm32f10x_pwr.h"
 #include "Delay.h"
 #include "OLED.h"
 #include "ZW101.h"
 #include "Key.h"
 #include "LED.h"
-#include "Servo.h" // ×¢ÈëĞÂ¶æ»úÄ£¿éÍ·ÎÄ¼ş
+#include "Servo.h"
 
-// ÔËĞĞÄ£Ê½¶¨Òå
+/* ============================================================
+   å®‰å…¨å¸¸é‡å®šä¹‰
+   ============================================================ */
+#define MAX_FAILED_ATTEMPTS   5       // æœ€å¤§è¿ç»­å¤±è´¥æ¬¡æ•°
+#define LOCKOUT_DURATION_MS   60000   // é”å®šæ—¶é—´ 60 ç§’
+#define PASSWORD_LENGTH       4       // å¯†ç ä½æ•°
+#define DEFAULT_PWD_D1        1       // é»˜è®¤å¯†ç ç¬¬1ä½
+#define DEFAULT_PWD_D2        2       // é»˜è®¤å¯†ç ç¬¬2ä½
+#define DEFAULT_PWD_D3        3       // é»˜è®¤å¯†ç ç¬¬3ä½
+#define DEFAULT_PWD_D4        4       // é»˜è®¤å¯†ç ç¬¬4ä½
+
+/* BKP å¯„å­˜å™¨åˆ†é… (æ‰ç”µå¯ä¿æŒï¼Œç”¨äºæŒä¹…åŒ–å­˜å‚¨å¯†ç ) */
+#define BKP_PWD_MAGIC   BKP_DR1   // é­”æ•°æ ‡è®°(0xA5A5è¡¨ç¤ºå¯†ç å·²åˆå§‹åŒ–)
+#define BKP_PWD_D1      BKP_DR2   // å¯†ç ç¬¬1ä½ (0~9)
+#define BKP_PWD_D2      BKP_DR3   // å¯†ç ç¬¬2ä½ (0~9)
+#define BKP_PWD_D3      BKP_DR4   // å¯†ç ç¬¬3ä½ (0~9)
+#define BKP_PWD_D4      BKP_DR5   // å¯†ç ç¬¬4ä½ (0~9)
+#define PWD_MAGIC_VAL   0xA5A5
+
+/* ============================================================
+   ç³»ç»Ÿæ¨¡å¼æšä¸¾
+   ============================================================ */
 typedef enum {
-    MODE_VERIFY,  // ¼ìË÷ÑéÖ¤Ä£Ê½ (Ä¬ÈÏÄ£Ê½)
-    MODE_ENROLL,  // ×¢²áÂ¼ÈëÄ£Ê½
-    MODE_EMPTY    // Çå¿ÕÖ¸ÎÆ¿âÄ£Ê½
+    MODE_MAIN_MENU,        // ä¸»èœå•
+    MODE_FINGERPRINT,      // æŒ‡çº¹éªŒè¯ï¼ˆåŸ MODE_VERIFYï¼‰
+    MODE_PASSWORD_UNLOCK,  // å¯†ç åå¤‡è§£é”
+    MODE_ADMIN_LOGIN,      // ç®¡ç†å‘˜ç™»å½•ï¼ˆè¾“å…¥å¯†ç ï¼‰
+    MODE_ADMIN_MENU,       // ç®¡ç†å‘˜èœå•
+    MODE_ADMIN_ENROLL,     // ç®¡ç†å‘˜ï¼šå½•å…¥æŒ‡çº¹
+    MODE_ADMIN_CLEAR,      // ç®¡ç†å‘˜ï¼šæ¸…ç©ºæŒ‡çº¹åº“
+    MODE_ADMIN_CHGPWD,     // ç®¡ç†å‘˜ï¼šä¿®æ”¹å¯†ç 
+    MODE_LOCKED            // ç³»ç»Ÿé”å®š
 } SystemMode;
 
-// ½»»¥¸¨ÖúÈ«¾Ö±äÁ¿
-uint16_t EnrollID = 1; // Ä¬ÈÏĞèÒªÂ¼ÈëµÄID
-SystemMode CurrentMode = MODE_VERIFY;
+/* ============================================================
+   å…¨å±€å˜é‡
+   ============================================================ */
+SystemMode CurrentMode = MODE_MAIN_MENU;    // å½“å‰ç³»ç»Ÿæ¨¡å¼
+uint8_t MainMenuSel = 1;                     // ä¸»èœå•é€‰ä¸­é¡¹ (1-3)
+uint8_t AdminMenuSel = 1;                    // ç®¡ç†å‘˜èœå•é€‰ä¸­é¡¹ (1-4)
+uint8_t FailedAttempts = 0;                  // è¿ç»­å¤±è´¥è®¡æ•°
+uint32_t LockStartTick = 0;                  // é”å®šèµ·å§‹æ—¶åˆ»(ms)
+uint16_t EnrollID = 1;                       // å½•å…¥ç›®æ ‡ID
+uint8_t AdminPassword[PASSWORD_LENGTH];      // ç®¡ç†å‘˜å¯†ç ç¼“å­˜ (è¿è¡Œæ—¶)
+uint8_t IsAdminAuthed = 0;                   // ç®¡ç†å‘˜å·²è®¤è¯æ ‡å¿—
 
-/* ²Ëµ¥ UI ÏÔÊ¾¸üĞÂ (¼ÓÈëÖĞ¶Ï°²È«Ëø£¬·ÀÖ¹Ë¢ĞÂÊ±±»´¥ÃşÖĞ¶Ï´ò¶Ïµ¼ÖÂÆÁÄ»ËÀËø) */
-void UI_ShowMenu(void)
+/* ============================================================
+   BKP å¯†ç è¯»å†™å‡½æ•°
+   ============================================================ */
+
+/**
+  * @brief  åˆå§‹åŒ– BKP åŒºåŸŸæ—¶é’Ÿä¸åå¤‡åŸŸè®¿é—®æƒé™
+  */
+void BKP_Init_Password(void)
 {
-    NVIC_DisableIRQ(EXTI4_IRQn);  // ÁÙÊ±¹Ø±Õ PA4 ´¥ÃşÖĞ¶Ï
-    NVIC_DisableIRQ(USART2_IRQn); // ÁÙÊ±¹Ø±Õ USART2 ´®¿Ú½ÓÊÕÖĞ¶Ï£¬·ÀÖ¹ÂÒÂë
-    
-    OLED_Clear();
-    OLED_ShowString(1, 1, "---ZW101 MENU---");
-    
-    if (CurrentMode == MODE_VERIFY)
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR | RCC_APB1Periph_BKP, ENABLE);
+    PWR_BackupAccessCmd(ENABLE);
+
+    // æ£€æŸ¥é­”æ•°ï¼šè‹¥æ— ï¼Œè¯´æ˜é¦–æ¬¡ä¸Šç”µï¼Œå†™å…¥é»˜è®¤å¯†ç 
+    if (BKP_ReadBackupRegister(BKP_PWD_MAGIC) != PWD_MAGIC_VAL)
     {
-        OLED_ShowString(2, 1,">1.Verify Mode");
-        OLED_ShowString(3, 1," 2.Enroll ID:");
-        OLED_ShowNum(3, 14, EnrollID, 2);
-        OLED_ShowString(4, 1," 3.Clear Library");
+        BKP_WriteBackupRegister(BKP_PWD_D1, DEFAULT_PWD_D1);
+        BKP_WriteBackupRegister(BKP_PWD_D2, DEFAULT_PWD_D2);
+        BKP_WriteBackupRegister(BKP_PWD_D3, DEFAULT_PWD_D3);
+        BKP_WriteBackupRegister(BKP_PWD_D4, DEFAULT_PWD_D4);
+        BKP_WriteBackupRegister(BKP_PWD_MAGIC, PWD_MAGIC_VAL);
     }
-    else if (CurrentMode == MODE_ENROLL)
-    {
-        OLED_ShowString(2, 1," 1.Verify Mode");
-        OLED_ShowString(3, 1,">2.Enroll ID:");
-        OLED_ShowNum(3, 14, EnrollID, 2);
-        OLED_ShowString(4, 1," 3.Clear Library");
-    }
-    else if (CurrentMode == MODE_EMPTY)
-    {
-        OLED_ShowString(2, 1," 1.Verify Mode");
-        OLED_ShowString(3, 1," 2.Enroll ID:");
-        OLED_ShowNum(3, 14, EnrollID, 2);
-        OLED_ShowString(4, 1,">3.Clear Library");
-    }
-    
-    NVIC_EnableIRQ(USART2_IRQn);  // Ë¢ĞÂÍê±Ï£¬ÖØĞÂ¿ªÆô´®¿Ú½ÓÊÕÖĞ¶Ï
-    NVIC_EnableIRQ(EXTI4_IRQn);   // Ë¢ĞÂÍê±Ï£¬ÖØĞÂ¿ªÆô´¥ÃşÖĞ¶Ï
+
+    // ä» BKP åŠ è½½åˆ° RAM ç¼“å­˜
+    AdminPassword[0] = (uint8_t)BKP_ReadBackupRegister(BKP_PWD_D1);
+    AdminPassword[1] = (uint8_t)BKP_ReadBackupRegister(BKP_PWD_D2);
+    AdminPassword[2] = (uint8_t)BKP_ReadBackupRegister(BKP_PWD_D3);
+    AdminPassword[3] = (uint8_t)BKP_ReadBackupRegister(BKP_PWD_D4);
 }
 
-/* ºËĞÄÂ¼Èë¿ØÖÆ (½»»¥Ê½£¬´ø°²È«ËøÓë°´¼üÏû¶¶) */
-void Do_Enroll(void)
+/**
+  * @brief  å°† RAM ä¸­çš„å¯†ç å†™å› BKP æŒä¹…åŒ–
+  */
+void BKP_Save_Password(void)
+{
+    BKP_WriteBackupRegister(BKP_PWD_D1, AdminPassword[0]);
+    BKP_WriteBackupRegister(BKP_PWD_D2, AdminPassword[1]);
+    BKP_WriteBackupRegister(BKP_PWD_D3, AdminPassword[2]);
+    BKP_WriteBackupRegister(BKP_PWD_D4, AdminPassword[3]);
+}
+
+/* ============================================================
+   é”å®šç®¡ç†å‡½æ•°
+   ============================================================ */
+
+/**
+  * @brief  æ£€æŸ¥æ˜¯å¦å¤„äºé”å®šçŠ¶æ€ï¼›è‹¥é”å®šå·²è¿‡æœŸåˆ™è‡ªåŠ¨è§£é™¤
+  * @retval 1: å·²é”å®š, 0: æœªé”å®š
+  */
+uint8_t IsLocked(void)
+{
+    if (FailedAttempts < MAX_FAILED_ATTEMPTS)
+        return 0;
+    return 1; // é”å®šä¸­ï¼Œç”± Do_LockedMode è´Ÿè´£å€’è®¡æ—¶è§£é™¤
+}
+
+/**
+  * @brief  è®°å½•ä¸€æ¬¡å¤±è´¥å°è¯•ï¼›è¶…é˜ˆå€¼åˆ™é”å®š
+  */
+void RecordFailedAttempt(void)
+{
+    FailedAttempts++;
+    if (FailedAttempts >= MAX_FAILED_ATTEMPTS)
+    {
+        LockStartTick = 0; // æ ‡è®°é”å®šå¼€å§‹
+        LED_Incorrect_ON();
+    }
+}
+
+/**
+  * @brief  éªŒè¯æˆåŠŸåé‡ç½®å¤±è´¥è®¡æ•°
+  */
+void ResetFailedAttempts(void)
+{
+    FailedAttempts = 0;
+    LockStartTick = 0;
+    LED_Incorrect_OFF();
+}
+
+/* ============================================================
+   UI è¾…åŠ©å‡½æ•°
+   ============================================================ */
+
+/**
+  * @brief  ä¸»èœå•æ˜¾ç¤º
+  */
+void UI_MainMenu(void)
+{
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    NVIC_DisableIRQ(USART2_IRQn);
+
+    OLED_Clear();
+    OLED_ShowString(1, 1, "--- Main Menu ---");
+
+    if (MainMenuSel == 1)
+    {
+        OLED_ShowString(2, 1, ">1.Fingerprint");
+        OLED_ShowString(3, 1, " 2.Password");
+        OLED_ShowString(4, 1, " 3.Admin");
+    }
+    else if (MainMenuSel == 2)
+    {
+        OLED_ShowString(2, 1, " 1.Fingerprint");
+        OLED_ShowString(3, 1, ">2.Password");
+        OLED_ShowString(4, 1, " 3.Admin");
+    }
+    else // sel == 3
+    {
+        OLED_ShowString(2, 1, " 1.Fingerprint");
+        OLED_ShowString(3, 1, " 2.Password");
+        OLED_ShowString(4, 1, ">3.Admin");
+    }
+
+    NVIC_EnableIRQ(USART2_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+}
+
+/**
+  * @brief  ç®¡ç†å‘˜èœå•æ˜¾ç¤º
+  */
+void UI_AdminMenu(void)
+{
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    NVIC_DisableIRQ(USART2_IRQn);
+
+    OLED_Clear();
+    OLED_ShowString(1, 1, "--- Admin Menu ---");
+
+    uint8_t sel = AdminMenuSel;
+    OLED_ShowString(2, 1, (sel == 1) ? ">1.Enroll Finger" : " 1.Enroll Finger");
+    OLED_ShowString(3, 1, (sel == 2) ? ">2.Clear Library" : " 2.Clear Library");
+    OLED_ShowString(4, 1, (sel == 3) ? ">3.Change PWD"    : " 3.Change PWD");
+
+    NVIC_EnableIRQ(USART2_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+}
+
+/**
+  * @brief  å¯†ç è¾“å…¥ UIï¼Œè¿”å› 1 è¡¨ç¤ºå®Œæˆè¾“å…¥ï¼Œè¿”å› 0 è¡¨ç¤ºå–æ¶ˆ
+  * @param  inputBuf: è¾“å‡ºç¼“å†²åŒºï¼Œå­˜æ”¾è¾“å…¥ç»“æœ(4å­—èŠ‚)
+  * @param  title: å±å¹•æ ‡é¢˜
+  * @retval 1: è¾“å…¥å®Œæˆ, 0: ç”¨æˆ·å–æ¶ˆ
+  */
+uint8_t UI_InputPassword(uint8_t *inputBuf, const char *title)
+{
+    uint8_t digits[PASSWORD_LENGTH] = {0, 0, 0, 0};
+    uint8_t pos = 0;  // å½“å‰æ­£åœ¨ç¼–è¾‘çš„ä½ (0~3)
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    NVIC_DisableIRQ(USART2_IRQn);
+    OLED_Clear();
+    OLED_ShowString(1, 1, (char *)title);
+    OLED_ShowString(2, 1, "Enter 4-digit:");
+    OLED_ShowString(4, 1, "K1:+ K2:OK K3:Esc");
+    NVIC_EnableIRQ(USART2_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+
+    // æ˜¾ç¤ºåˆå§‹å€¼
+    while (1)
+    {
+        // åˆ·æ–°å¯†ç æ˜¾ç¤ºè¡Œ
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        NVIC_DisableIRQ(USART2_IRQn);
+        OLED_ShowString(3, 1, "                "); // æ¸…è¡Œ
+        for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+        {
+            OLED_ShowNum(3, 1 + i * 4, digits[i], 1);
+        }
+        // å…‰æ ‡æŒ‡ç¤ºå½“å‰ä½ç½®
+        OLED_ShowString(3, 1 + pos * 4, "^");
+        NVIC_EnableIRQ(USART2_IRQn);
+        NVIC_EnableIRQ(EXTI4_IRQn);
+
+        uint8_t key = Key_GetNum();
+        if (key == 1)  // K1: æ•°å­—é€’å¢
+        {
+            digits[pos]++;
+            if (digits[pos] > 9) digits[pos] = 0;
+        }
+        else if (key == 2)  // K2: ç¡®è®¤å½“å‰ä½
+        {
+            pos++;
+            if (pos >= PASSWORD_LENGTH)
+            {
+                // 4ä½å…¨éƒ¨è¾“å®Œï¼Œç¡®è®¤
+                for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+                    inputBuf[i] = digits[i];
+                return 1;
+            }
+        }
+        else if (key == 3)  // K3: å–æ¶ˆ
+        {
+            return 0;
+        }
+        Delay_ms(10);
+    }
+}
+
+/* ============================================================
+   æ¨¡å¼åŠŸèƒ½å‡½æ•°
+   ============================================================ */
+
+/**
+  * @brief  æŒ‡çº¹éªŒè¯æ¨¡å¼
+  */
+void Do_FingerprintVerify(void)
+{
+    uint8_t status;
+    uint16_t matchedID = 0;
+    uint16_t score = 0;
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    OLED_Clear();
+    OLED_ShowString(1, 1, "[FINGERPRINT]");
+    OLED_ShowString(2, 1, "Place Finger...");
+    OLED_ShowString(4, 1, "K3:Back");
+    NVIC_EnableIRQ(EXTI4_IRQn);
+
+    while (1)
+    {
+        status = ZW101_GetImage();
+        if (status == 0x00)
+        {
+            NVIC_DisableIRQ(EXTI4_IRQn);
+            OLED_Clear();
+            OLED_ShowString(1, 1, "Processing...");
+            NVIC_EnableIRQ(EXTI4_IRQn);
+
+            status = ZW101_GenChar(1);
+            if (status == 0x00)
+            {
+                status = ZW101_Search(&matchedID, &score);
+                if (status == 0x00)
+                {
+                    // æŒ‡çº¹åŒ¹é… â†’ è¿›å…¥å¯†ç äºŒæ¬¡éªŒè¯
+                    NVIC_DisableIRQ(EXTI4_IRQn);
+                    OLED_Clear();
+                    OLED_ShowString(1, 1, "Fingerprint OK!");
+                    OLED_ShowString(2, 1, "ID: ");
+                    OLED_ShowNum(2, 5, matchedID, 2);
+                    OLED_ShowString(3, 1, "Enter PWD to open");
+                    NVIC_EnableIRQ(EXTI4_IRQn);
+
+                    // æŒ‡çº¹åŒ¹é…æˆåŠŸï¼Œç›´æ¥å¼€é—¨
+                    ResetFailedAttempts();
+                    NVIC_DisableIRQ(EXTI4_IRQn);
+                    OLED_Clear();
+                    OLED_ShowString(1, 1, "Access Granted!");
+                    OLED_ShowString(2, 1, "ID: ");
+                    OLED_ShowNum(2, 5, matchedID, 2);
+                    OLED_ShowString(3, 1, "Score: ");
+                    OLED_ShowNum(3, 8, score, 3);
+                    OLED_ShowString(4, 1, "[Unlocking...]");
+                    NVIC_EnableIRQ(EXTI4_IRQn);
+
+                    LED_Correct_ON();
+                    LED_Incorrect_OFF();
+                    Servo_SetAngle(80.0f);
+                    Delay_ms(3000);
+                    Servo_SetAngle(0.0f);
+                    LED_Correct_OFF();
+                    break;
+                }
+                else
+                {
+                    // éªŒè¯å¤±è´¥
+                    RecordFailedAttempt();
+                    NVIC_DisableIRQ(EXTI4_IRQn);
+                    OLED_Clear();
+                    OLED_ShowString(1, 1, "Access Denied!");
+                    OLED_ShowString(2, 1, "Not Recognized");
+                    OLED_ShowString(3, 1, "Fails: ");
+                    OLED_ShowNum(3, 8, FailedAttempts, 1);
+                    OLED_ShowString(4, 1, "/5  Retry...");
+                    NVIC_EnableIRQ(EXTI4_IRQn);
+
+                    LED_Incorrect_ON();
+                    Delay_ms(1500);
+                    LED_Incorrect_OFF();
+                }
+            }
+            else
+            {
+                NVIC_DisableIRQ(EXTI4_IRQn);
+                OLED_Clear();
+                OLED_ShowString(1, 1, "Bad Image");
+                OLED_ShowString(2, 1, "Press harder");
+                NVIC_EnableIRQ(EXTI4_IRQn);
+                Delay_ms(1000);
+            }
+
+            // æ£€æŸ¥æ˜¯å¦è§¦å‘é”å®š
+            if (FailedAttempts >= MAX_FAILED_ATTEMPTS)
+                break;
+
+            // åˆ·æ–°ç­‰å¾…ç•Œé¢
+            NVIC_DisableIRQ(EXTI4_IRQn);
+            OLED_Clear();
+            OLED_ShowString(1, 1, "[FINGERPRINT]");
+            OLED_ShowString(2, 1, "Place Finger...");
+            OLED_ShowString(4, 1, "K3:Back");
+            NVIC_EnableIRQ(EXTI4_IRQn);
+        }
+
+        // K3 è¿”å›
+        if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0)
+        {
+            Delay_ms(20);
+            while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0);
+            Delay_ms(20);
+            break;
+        }
+    }
+}
+
+/**
+  * @brief  å¯†ç åå¤‡è§£é”æ¨¡å¼
+  */
+void Do_PasswordUnlock(void)
+{
+    uint8_t input[PASSWORD_LENGTH];
+
+    // æ£€æŸ¥æ˜¯å¦å·²è¾¾æœ€å¤§å¤±è´¥æ¬¡æ•°
+    if (FailedAttempts >= MAX_FAILED_ATTEMPTS)
+        return;
+
+    if (!UI_InputPassword(input, "Password Unlock"))
+        return; // ç”¨æˆ·å–æ¶ˆ
+
+    // æ¯”å¯¹å¯†ç 
+    uint8_t match = 1;
+    for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+    {
+        if (input[i] != AdminPassword[i])
+        {
+            match = 0;
+            break;
+        }
+    }
+
+    if (match)
+    {
+        ResetFailedAttempts();
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Access Granted!");
+        OLED_ShowString(2, 1, "Password OK");
+        OLED_ShowString(4, 1, "[Unlocking...]");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+
+        LED_Correct_ON();
+        LED_Incorrect_OFF();
+        Servo_SetAngle(80.0f);
+        Delay_ms(3000);
+        Servo_SetAngle(0.0f);
+        LED_Correct_OFF();
+    }
+    else
+    {
+        RecordFailedAttempt();
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Wrong Password!");
+        OLED_ShowString(2, 1, "Fails: ");
+        OLED_ShowNum(2, 8, FailedAttempts, 1);
+        OLED_ShowString(3, 1, "/5  Try again...");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+
+        LED_Incorrect_ON();
+        Delay_ms(2000);
+        LED_Incorrect_OFF();
+    }
+}
+
+/**
+  * @brief  ç®¡ç†å‘˜ç™»å½•
+  */
+void Do_AdminLogin(void)
+{
+    uint8_t input[PASSWORD_LENGTH];
+
+    if (FailedAttempts >= MAX_FAILED_ATTEMPTS)
+        return;
+
+    if (!UI_InputPassword(input, "Admin Login"))
+        return;
+
+    uint8_t match = 1;
+    for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+    {
+        if (input[i] != AdminPassword[i])
+        {
+            match = 0;
+            break;
+        }
+    }
+
+    if (match)
+    {
+        IsAdminAuthed = 1;
+        ResetFailedAttempts();
+        CurrentMode = MODE_ADMIN_MENU;
+        AdminMenuSel = 1;
+
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Login Success!");
+        OLED_ShowString(2, 1, "Welcome Admin");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(1000);
+    }
+    else
+    {
+        RecordFailedAttempt();
+        IsAdminAuthed = 0;
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Wrong Password!");
+        OLED_ShowString(2, 1, "Access Denied");
+        OLED_ShowString(3, 1, "Fails: ");
+        OLED_ShowNum(3, 8, FailedAttempts, 1);
+        NVIC_EnableIRQ(EXTI4_IRQn);
+        LED_Incorrect_ON();
+        Delay_ms(2000);
+        LED_Incorrect_OFF();
+        CurrentMode = MODE_MAIN_MENU;
+    }
+}
+
+/**
+  * @brief  ç®¡ç†å‘˜ï¼šå½•å…¥æŒ‡çº¹
+  */
+void Do_AdminEnroll(void)
 {
     uint8_t status;
     uint8_t cancelFlag = 0;
-    
-    NVIC_DisableIRQ(EXTI4_IRQn); // ÁÙÊ±¹Ø±ÕÖĞ¶Ï
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
     OLED_Clear();
     OLED_ShowString(1, 1, "--- Enroll ID ---");
     OLED_ShowString(2, 1, "Target ID: ");
     OLED_ShowNum(2, 12, EnrollID, 2);
     OLED_ShowString(3, 1, "Place Finger... ");
     OLED_ShowString(4, 1, "K3 to Cancel");
-    NVIC_EnableIRQ(EXTI4_IRQn);  // ÖØĞÂ¿ªÆôÖĞ¶Ï
-    
-    // 1. µÈ´ı°´Ñ¹ÊÖÖ¸ (¼ì²âÊÇ·ñÓĞ°´¼ü3°´ÏÂ¿ÉÍË³ö£¬±ÜÃâ¿¨ËÀ)
+    NVIC_EnableIRQ(EXTI4_IRQn);
+
+    // ç¬¬ä¸€æ¬¡æŒ‰å‹
     while (1)
     {
         status = ZW101_GetImage();
-        if (status == 0x00) // ³É¹¦»ñÈ¡Í¼Ïñ
-        {
-            break;
-        }
-        
-        // Èô°´¼ü3°´ÏÂ£¬ÍË³öµ±Ç°Â¼Èë²Ù×÷
+        if (status == 0x00) break;
         if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0)
         {
             cancelFlag = 1;
@@ -84,18 +511,16 @@ void Do_Enroll(void)
         }
         Delay_ms(100);
     }
-    
     if (cancelFlag)
     {
         NVIC_DisableIRQ(EXTI4_IRQn);
         OLED_Clear();
         OLED_ShowString(1, 1, "Enroll Cancelled");
-        Delay_ms(1500);
         NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(1500);
         return;
     }
-    
-    // Éú³ÉÌØÕ÷Âë1
+
     status = ZW101_GenChar(1);
     if (status != 0x00)
     {
@@ -103,39 +528,34 @@ void Do_Enroll(void)
         OLED_Clear();
         OLED_ShowString(1, 1, "GenChar 1 Fail");
         OLED_ShowHexNum(2, 1, status, 2);
-        Delay_ms(2000);
         NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(2000);
         return;
     }
-    
-    // 2. ÌáÊ¾Ì§ÆğÊÖÖ¸
+
+    // æç¤ºæŠ¬èµ·
     NVIC_DisableIRQ(EXTI4_IRQn);
     OLED_Clear();
     OLED_ShowString(1, 1, "Lift Finger...");
-    LED_Correct_ON(); // µÚÒ»´Î¶ÁÈ¡³É¹¦ÌáÊ¾
+    LED_Correct_ON();
     Delay_ms(500);
     LED_Correct_OFF();
     NVIC_EnableIRQ(EXTI4_IRQn);
-    
-    while (ZW101_GetImage() == 0x00)
-    {
-        Delay_ms(100); // Ñ­»·µÈ´ıÌ§ÆğÊÖÖ¸
-    }
-    
-    // 3. ÔÙ´Î°´Ñ¹ÊÖÖ¸
+
+    while (ZW101_GetImage() == 0x00) { Delay_ms(100); }
+
+    // ç¬¬äºŒæ¬¡æŒ‰å‹
     NVIC_DisableIRQ(EXTI4_IRQn);
     OLED_Clear();
     OLED_ShowString(1, 1, "Place Finger 2nd");
-    OLED_ShowString(2, 1, "Press same finger");
+    OLED_ShowString(2, 1, "Same finger");
     NVIC_EnableIRQ(EXTI4_IRQn);
-    
+
+    cancelFlag = 0;
     while (1)
     {
         status = ZW101_GetImage();
-        if (status == 0x00)
-        {
-            break;
-        }
+        if (status == 0x00) break;
         if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0)
         {
             cancelFlag = 1;
@@ -143,18 +563,16 @@ void Do_Enroll(void)
         }
         Delay_ms(100);
     }
-    
     if (cancelFlag)
     {
         NVIC_DisableIRQ(EXTI4_IRQn);
         OLED_Clear();
         OLED_ShowString(1, 1, "Enroll Cancelled");
-        Delay_ms(1500);
         NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(1500);
         return;
     }
-    
-    // Éú³ÉÌØÕ÷Âë2
+
     status = ZW101_GenChar(2);
     if (status != 0x00)
     {
@@ -162,17 +580,17 @@ void Do_Enroll(void)
         OLED_Clear();
         OLED_ShowString(1, 1, "GenChar 2 Fail");
         OLED_ShowHexNum(2, 1, status, 2);
-        Delay_ms(2000);
         NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(2000);
         return;
     }
-    
-    // 4. ºÏ²¢²¢±£´æ
+
+    // åˆå¹¶ä¿å­˜
     NVIC_DisableIRQ(EXTI4_IRQn);
     OLED_Clear();
     OLED_ShowString(1, 1, "Merging...");
     NVIC_EnableIRQ(EXTI4_IRQn);
-    
+
     status = ZW101_RegModel();
     if (status == 0x00)
     {
@@ -182,11 +600,10 @@ void Do_Enroll(void)
             NVIC_DisableIRQ(EXTI4_IRQn);
             OLED_Clear();
             OLED_ShowString(1, 1, "Enroll Success!");
-            OLED_ShowString(2, 1, "ID registered:");
-            OLED_ShowNum(2, 15, EnrollID, 2);
+            OLED_ShowString(2, 1, "ID: ");
+            OLED_ShowNum(2, 5, EnrollID, 2);
             NVIC_EnableIRQ(EXTI4_IRQn);
-            
-            // ÉÁË¸Èı´ÎÖ¸Ê¾µÆ±íÊ¾³É¹¦
+
             for (int i = 0; i < 3; i++)
             {
                 LED_Correct_ON();
@@ -194,8 +611,6 @@ void Do_Enroll(void)
                 LED_Correct_OFF();
                 Delay_ms(100);
             }
-            
-            // ×Ô¶¯ÀÛ¼ÓID±àºÅ£¬×¼±¸ÏÂÒ»´Î¿ìËÙÂ¼Èë
             EnrollID++;
             if (EnrollID > 99) EnrollID = 1;
         }
@@ -216,7 +631,7 @@ void Do_Enroll(void)
         NVIC_DisableIRQ(EXTI4_IRQn);
         OLED_Clear();
         OLED_ShowString(1, 1, "Merge Failed");
-        OLED_ShowString(2, 1, "Are they same?");
+        OLED_ShowString(2, 1, "Same finger?");
         NVIC_EnableIRQ(EXTI4_IRQn);
         LED_Incorrect_ON();
         Delay_ms(2000);
@@ -224,149 +639,38 @@ void Do_Enroll(void)
     }
 }
 
-/* ºËĞÄ±È¶ÔÑéÖ¤Ä£Ê½ (¼ìË÷Ä£Ê½) */
-void Do_Verify(void)
-{
-    uint8_t status;
-    uint16_t matchedID = 0;
-    uint16_t score = 0;
-    
-    NVIC_DisableIRQ(EXTI4_IRQn); // Ë¢ĞÂÇ°¹Ø±Õ´¥ÃşÖĞ¶Ï£¬ÑÏ·ÀI2C×ÜÏßËÀËø
-    OLED_Clear();
-    OLED_ShowString(1, 1, "[VERIFY MODE]");
-    OLED_ShowString(2, 1, "Place Finger...");
-    OLED_ShowString(4, 1, "Press K3 to Menu");
-    NVIC_EnableIRQ(EXTI4_IRQn);  // ÖØĞÂÊ¹ÄÜÖĞ¶Ï
-    
-    while (1)
-    {
-        // ³ÖĞø»ñÈ¡Í¼Ïñ
-        status = ZW101_GetImage();
-        if (status == 0x00) // »ñÈ¡µ½Ö¸ÎÆ
-        {
-            NVIC_DisableIRQ(EXTI4_IRQn);
-            OLED_Clear();
-            OLED_ShowString(1, 1, "Processing...");
-            NVIC_EnableIRQ(EXTI4_IRQn);
-            
-            // Éú³ÉÌØÕ÷ÂëÔÚBuffer1ÖĞ
-            status = ZW101_GenChar(1);
-            if (status == 0x00)
-            {
-                // È«¿â¼ìË÷Æ¥Åä
-                status = ZW101_Search(&matchedID, &score);
-                if (status == 0x00) // ¼ìË÷µ½ÁË¶ÔÓ¦Ö¸ÎÆ
-                {
-                    NVIC_DisableIRQ(EXTI4_IRQn);
-                    OLED_Clear();
-                    OLED_ShowString(1, 1, "Verify Success!");
-                    OLED_ShowString(2, 1, "ID matched: ");
-                    OLED_ShowNum(2, 13, matchedID, 2);
-                    OLED_ShowString(3, 1, "Score: ");
-                    OLED_ShowNum(3, 8, score, 3);
-                    OLED_ShowString(4, 1, "[Unlocking...]"); // OLEDÌáÊ¾½âËø¿ªÃÅ
-                    NVIC_EnableIRQ(EXTI4_IRQn);
-                    
-                    // ÕıÈ·Ö¸ÎÆ£¬ÁÁ A1 µÆÒ»ÃëÖÓ
-                    LED_Correct_ON();
-                    LED_Incorrect_OFF();
-                    
-                    // ============================================
-                    // ĞÂÔö£º±È¶Ô³É¹¦£¬Çı¶¯ MG996R Ğı×ªµ½ 80 ¶È¿ªÃÅ
-                    // ============================================
-                    Servo_SetAngle(80.0f); 
-                    
-                    Delay_ms(2000); // Î¬³Ö¿ªÆô¿ªÃÅ×´Ì¬ 2 ÃëÖÓ
-                    
-                    // ============================================
-                    // ĞÂÔö£º×Ô¶¯¹ØÃÅ¸´Î»µ½ 0 ¶È
-                    // ============================================
-                    Servo_SetAngle(0.0f);
-                    
-                    LED_Correct_OFF();
-                }
-                else // Ö¸ÎÆ²»Æ¥Åä
-                {
-                    NVIC_DisableIRQ(EXTI4_IRQn);
-                    OLED_Clear();
-                    OLED_ShowString(1, 1, "Verify Failed!");
-                    OLED_ShowString(2, 1, "Finger Not Found");
-                    OLED_ShowString(3, 1, "Error Code: ");
-                    OLED_ShowHexNum(3, 13, status, 2);
-                    NVIC_EnableIRQ(EXTI4_IRQn);
-                    
-                    // ´íÎóÖ¸ÎÆ£¬ÁÁ A0 µÆÒ»ÃëÖÓ
-                    LED_Incorrect_ON();
-                    LED_Correct_OFF();
-                    Delay_ms(1000);
-                    LED_Incorrect_OFF();
-                }
-            }
-            else
-            {
-                NVIC_DisableIRQ(EXTI4_IRQn);
-                OLED_Clear();
-                OLED_ShowString(1, 1, "Bad Finger Print");
-                OLED_ShowString(2, 1, "Try again");
-                NVIC_EnableIRQ(EXTI4_IRQn);
-                
-                LED_Incorrect_ON();
-                Delay_ms(800);
-                LED_Incorrect_OFF();
-            }
-            
-            // ½á¹ûÏÔÊ¾Íê±ÏºóÌáÊ¾ÖØĞÂ·ÅÖÃ
-            Delay_ms(1000);
-            NVIC_DisableIRQ(EXTI4_IRQn);
-            OLED_Clear();
-            OLED_ShowString(1, 1, "[VERIFY MODE]");
-            OLED_ShowString(2, 1, "Place Finger...");
-            OLED_ShowString(4, 1, "Press K3 to Menu");
-            NVIC_EnableIRQ(EXTI4_IRQn);
-        }
-        
-        // Èô°´¼ü3°´ÏÂ£¬ÍË³ö¼ìË÷Ä£Ê½£¬·µ»Ø²Ëµ¥
-        if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0)
-        {
-            Delay_ms(20); // ¼òÒ×°´¼üÏû¶¶
-            while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_11) == 0);
-            Delay_ms(20);
-            break;
-        }
-    }
-}
-
-/* Ò»¼ü¸ñÊ½»¯Çå¿ÕÖ¸ÎÆ¿â */
-void Do_EmptyLibrary(void)
+/**
+  * @brief  ç®¡ç†å‘˜ï¼šæ¸…ç©ºæŒ‡çº¹åº“ï¼ˆå¸¦äºŒæ¬¡ç¡®è®¤ï¼‰
+  */
+void Do_AdminClear(void)
 {
     uint8_t key;
+
     NVIC_DisableIRQ(EXTI4_IRQn);
     OLED_Clear();
-    OLED_ShowString(1, 1, "?? WARNING ??");
-    OLED_ShowString(2, 1, "Are you sure?");
-    OLED_ShowString(3, 1, "K1:Confirm");
-    OLED_ShowString(4, 1, "K3:Cancel");
+    OLED_ShowString(1, 1, "!! WARNING !!");
+    OLED_ShowString(2, 1, "Clear ALL prints?");
+    OLED_ShowString(3, 1, "K1:Yes  K3:No");
     NVIC_EnableIRQ(EXTI4_IRQn);
-    
+
     while (1)
     {
         key = Key_GetNum();
-        if (key == 1) // K1°´ÏÂ£¬Ö´ĞĞÇå¿Õ
+        if (key == 1)
         {
             NVIC_DisableIRQ(EXTI4_IRQn);
             OLED_Clear();
             OLED_ShowString(1, 1, "Clearing Flash...");
             NVIC_EnableIRQ(EXTI4_IRQn);
-            
+
             uint8_t status = ZW101_EmptyLibrary();
             if (status == 0x00)
             {
                 NVIC_DisableIRQ(EXTI4_IRQn);
                 OLED_Clear();
                 OLED_ShowString(1, 1, "Clear Success!");
+                OLED_ShowString(2, 1, "Library Empty");
                 NVIC_EnableIRQ(EXTI4_IRQn);
-                
-                // ºìÂÌË«µÆÉÁË¸ÌáÊ¾Íê³É
                 for (int i = 0; i < 4; i++)
                 {
                     GPIO_ResetBits(GPIOA, GPIO_Pin_0 | GPIO_Pin_1);
@@ -374,6 +678,7 @@ void Do_EmptyLibrary(void)
                     GPIO_SetBits(GPIOA, GPIO_Pin_0 | GPIO_Pin_1);
                     Delay_ms(150);
                 }
+                EnrollID = 1;
             }
             else
             {
@@ -386,83 +691,288 @@ void Do_EmptyLibrary(void)
             }
             break;
         }
-        else if (key == 3) // K3È¡Ïû
+        else if (key == 3)
         {
             break;
         }
     }
 }
 
+/**
+  * @brief  ç®¡ç†å‘˜ï¼šä¿®æ”¹å¯†ç 
+  */
+void Do_ChangePassword(void)
+{
+    uint8_t oldPwd[PASSWORD_LENGTH];
+    uint8_t newPwd[PASSWORD_LENGTH];
+
+    // ç¬¬ä¸€æ­¥ï¼šéªŒè¯æ—§å¯†ç 
+    if (!UI_InputPassword(oldPwd, "Enter Old PWD"))
+        return;
+
+    uint8_t match = 1;
+    for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+    {
+        if (oldPwd[i] != AdminPassword[i]) { match = 0; break; }
+    }
+    if (!match)
+    {
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Wrong Old PWD!");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+        LED_Incorrect_ON();
+        Delay_ms(2000);
+        LED_Incorrect_OFF();
+        return;
+    }
+
+    // ç¬¬äºŒæ­¥ï¼šè¾“å…¥æ–°å¯†ç 
+    if (!UI_InputPassword(newPwd, "Enter New PWD"))
+        return;
+
+    // ç¬¬ä¸‰æ­¥ï¼šç¡®è®¤æ–°å¯†ç 
+    uint8_t confirm[PASSWORD_LENGTH];
+    if (!UI_InputPassword(confirm, "Confirm New PWD"))
+        return;
+
+    uint8_t same = 1;
+    for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+    {
+        if (newPwd[i] != confirm[i]) { same = 0; break; }
+    }
+    if (!same)
+    {
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_Clear();
+        OLED_ShowString(1, 1, "Mismatch!");
+        OLED_ShowString(2, 1, "Not changed");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(2000);
+        return;
+    }
+
+    // ä¿å­˜æ–°å¯†ç 
+    for (uint8_t i = 0; i < PASSWORD_LENGTH; i++)
+        AdminPassword[i] = newPwd[i];
+    BKP_Save_Password();
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    OLED_Clear();
+    OLED_ShowString(1, 1, "Password Changed!");
+    OLED_ShowString(2, 1, "New PWD saved");
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    for (int i = 0; i < 3; i++)
+    {
+        LED_Correct_ON();
+        Delay_ms(200);
+        LED_Correct_OFF();
+        Delay_ms(100);
+    }
+}
+
+/**
+  * @brief  é”å®šæ¨¡å¼ï¼šæ˜¾ç¤ºå€’è®¡æ—¶å¹¶ç­‰å¾…è§£é™¤
+  */
+void Do_LockedMode(void)
+{
+    uint16_t remaining;
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    OLED_Clear();
+    OLED_ShowString(1, 1, "!!! LOCKED !!!");
+    OLED_ShowString(2, 1, "Too many fails");
+    NVIC_EnableIRQ(EXTI4_IRQn);
+
+    LED_Incorrect_ON();
+
+    // 60ç§’å€’è®¡æ—¶
+    for (uint16_t sec = 60; sec > 0; sec--)
+    {
+        remaining = sec;
+        NVIC_DisableIRQ(EXTI4_IRQn);
+        OLED_ShowString(3, 1, "Wait: ");
+        OLED_ShowNum(3, 7, remaining, 2);
+        OLED_ShowString(3, 10, "s  ");
+        NVIC_EnableIRQ(EXTI4_IRQn);
+        Delay_ms(1000);
+    }
+
+    // é”å®šè§£é™¤
+    ResetFailedAttempts();
+    LED_Incorrect_OFF();
+
+    NVIC_DisableIRQ(EXTI4_IRQn);
+    OLED_Clear();
+    OLED_ShowString(1, 1, "Lock Released");
+    OLED_ShowString(2, 1, "System Ready");
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    Delay_ms(1500);
+
+    CurrentMode = MODE_MAIN_MENU;
+    MainMenuSel = 1;
+}
+
+/* ============================================================
+   ä¸»å‡½æ•°
+   ============================================================ */
 int main(void)
 {
-    // 1. ³õÊ¼»¯¸÷Àà»ù´¡ÍâÉè
+    // 1. åˆå§‹åŒ–å¤–è®¾
     OLED_Init();
     LED_Init();
     Key_Init();
-    Servo_Init(); // ================= ĞÂÔö£º³õÊ¼»¯¶æ»úÇı¶¯¿ØÖÆ =================
-    
-    OLED_ShowString(1, 1, "System Initial...");
-    
-    // ³õÊ¼»¯¶æ»úÖÁ³õÊ¼½Ç¶È0¡ã (´ú±í±ÕËø/³õÊ¼×´Ì¬)
+    Servo_Init();
+
+    // 2. åˆå§‹åŒ–å¯†ç ç³»ç»Ÿï¼ˆBKPï¼‰
+    BKP_Init_Password();
+
+    // 3. åˆå§‹åŒ–æŒ‡çº¹æ¨¡å—
+    OLED_ShowString(1, 1, "System Init...");
     Servo_SetAngle(0.0f);
-    
-    // 2. ³õÊ¼»¯Ö¸ÎÆÄ£¿éÍ¨Ñ¶²¨ÌØÂÊÓë´¥Ãş¼ì²âÖĞ¶Ï
-    ZW101_Init(57600); 
-    ZW101_Touch_Init();  // ¿ªÆô PA4 WAKE Òı½Å´¥Ãş¼ì²âÖĞ¶Ï
-    Delay_ms(1000);
-    
-    UI_ShowMenu();
-    
+    ZW101_Init(57600);
+    ZW101_Touch_Init();
+    Delay_ms(800);
+
+    // 4. è¿›å…¥ä¸»èœå•
+    CurrentMode = MODE_MAIN_MENU;
+    MainMenuSel = 1;
+    IsAdminAuthed = 0;
+    UI_MainMenu();
+
+    // 5. ä¸»å¾ªç¯
     while (1)
     {
-        // ²¶»ñÓÃ»§²Ù×÷°´¼ü
-        uint8_t key = Key_GetNum();
-        
-        if (key == 1) // PB0 (°´¼ü1) -> ÇĞ»»ÔËĞĞÑ¡Ïî
+        // æŒç»­æ£€æµ‹é”å®šçŠ¶æ€
+        if (FailedAttempts >= MAX_FAILED_ATTEMPTS)
         {
-            if (CurrentMode == MODE_VERIFY)
-            {
-                CurrentMode = MODE_ENROLL;
-            }
-            else if (CurrentMode == MODE_ENROLL)
-            {
-                CurrentMode = MODE_EMPTY;
-            }
-            else if (CurrentMode == MODE_EMPTY)
-            {
-                CurrentMode = MODE_VERIFY;
-            }
-            UI_ShowMenu();
+            CurrentMode = MODE_LOCKED;
+            Do_LockedMode();
+            // é”å®šè§£é™¤åå›åˆ°ä¸»èœå•
+            UI_MainMenu();
+            continue;
         }
-        else if (key == 2) // PB10 (°´¼ü2) -> ¶ÔÓ¦Ñ¡Ïî²ÎÊı²Ù×÷
+
+        // æ ¹æ®å½“å‰æ¨¡å¼å¤„ç†
+        switch (CurrentMode)
         {
-            if (CurrentMode == MODE_ENROLL)
+            /* ---------- ä¸»èœå• ---------- */
+            case MODE_MAIN_MENU:
             {
-                EnrollID++;
-                if (EnrollID > 99) EnrollID = 1;
-                UI_ShowMenu();
+                uint8_t key = Key_GetNum();
+                if (key == 1) // K1: åˆ‡æ¢é€‰é¡¹
+                {
+                    MainMenuSel++;
+                    if (MainMenuSel > 3) MainMenuSel = 1;
+                    UI_MainMenu();
+                }
+                else if (key == 3) // K3: ç¡®è®¤è¿›å…¥
+                {
+                    if (MainMenuSel == 1)
+                        CurrentMode = MODE_FINGERPRINT;
+                    else if (MainMenuSel == 2)
+                        CurrentMode = MODE_PASSWORD_UNLOCK;
+                    else if (MainMenuSel == 3)
+                        CurrentMode = MODE_ADMIN_LOGIN;
+                }
+                break;
             }
-        }
-        else if (key == 3) // PB11 (°´¼ü3) -> È·¶¨È·ÈÏ½øÈë¸ÃÄ£Ê½
-        {
-            if (CurrentMode == MODE_VERIFY)
+
+            /* ---------- æŒ‡çº¹éªŒè¯ ---------- */
+            case MODE_FINGERPRINT:
+                Do_FingerprintVerify();
+                Delay_ms(300);
+                UI_MainMenu();
+                CurrentMode = MODE_MAIN_MENU;
+                break;
+
+            /* ---------- å¯†ç åå¤‡è§£é” ---------- */
+            case MODE_PASSWORD_UNLOCK:
+                Do_PasswordUnlock();
+                Delay_ms(300);
+                UI_MainMenu();
+                CurrentMode = MODE_MAIN_MENU;
+                break;
+
+            /* ---------- ç®¡ç†å‘˜ç™»å½• ---------- */
+            case MODE_ADMIN_LOGIN:
+                Do_AdminLogin();
+                if (CurrentMode == MODE_ADMIN_MENU)
+                {
+                    UI_AdminMenu();
+                }
+                else
+                {
+                    // ç™»å½•å¤±è´¥å›åˆ°ä¸»èœå•
+                    UI_MainMenu();
+                }
+                break;
+
+            /* ---------- ç®¡ç†å‘˜èœå• ---------- */
+            case MODE_ADMIN_MENU:
             {
-                Do_Verify();       // ½øÈëÑéÖ¤¼ìË÷
-                Delay_ms(300);     // ÍË³öºóÍË±ÜÏû¶¶300ms£¬ÑÏ·ÀÒò°´¼üÊÖ¶¶¿ìËÙ¡°¶ş´Î½øÈë¡±µ¼ÖÂÏµÍ³¿¨ËÀ
-                UI_ShowMenu();     // ÍË³öºóÏÔÊ¾²Ëµ¥
+                uint8_t key = Key_GetNum();
+                if (key == 1) // K1: åˆ‡æ¢é€‰é¡¹ (1-3å¾ªç¯)
+                {
+                    AdminMenuSel++;
+                    if (AdminMenuSel > 3) AdminMenuSel = 1;
+                    UI_AdminMenu();
+                }
+                else if (key == 2) // K2: é€€å‡ºç®¡ç†å‘˜æ¨¡å¼
+                {
+                    IsAdminAuthed = 0;
+                    CurrentMode = MODE_MAIN_MENU;
+                    MainMenuSel = 1;
+                    UI_MainMenu();
+                }
+                else if (key == 3) // K3: ç¡®è®¤è¿›å…¥
+                {
+                    if (AdminMenuSel == 1)
+                        CurrentMode = MODE_ADMIN_ENROLL;
+                    else if (AdminMenuSel == 2)
+                        CurrentMode = MODE_ADMIN_CLEAR;
+                    else if (AdminMenuSel == 3)
+                        CurrentMode = MODE_ADMIN_CHGPWD;
+                }
+                break;
             }
-            else if (CurrentMode == MODE_ENROLL)
-            {
-                Do_Enroll();       // ½øÈë×¢²áÂ¼ÈëÁ÷³Ì
-                Delay_ms(300);     // ÍË±ÜÑÓÊ±
-                UI_ShowMenu();
-            }
-            else if (CurrentMode == MODE_EMPTY)
-            {
-                Do_EmptyLibrary(); // ¸ñÊ½»¯Çå¿Õ¿â
-                Delay_ms(300);     // ÍË±ÜÑÓÊ±
-                UI_ShowMenu();
-            }
+
+            /* ---------- ç®¡ç†å‘˜ï¼šå½•å…¥ ---------- */
+            case MODE_ADMIN_ENROLL:
+                Do_AdminEnroll();
+                Delay_ms(300);
+                UI_AdminMenu();
+                CurrentMode = MODE_ADMIN_MENU;
+                break;
+
+            /* ---------- ç®¡ç†å‘˜ï¼šæ¸…åº“ ---------- */
+            case MODE_ADMIN_CLEAR:
+                Do_AdminClear();
+                Delay_ms(300);
+                UI_AdminMenu();
+                CurrentMode = MODE_ADMIN_MENU;
+                break;
+
+            /* ---------- ç®¡ç†å‘˜ï¼šæ”¹å¯† ---------- */
+            case MODE_ADMIN_CHGPWD:
+                Do_ChangePassword();
+                Delay_ms(300);
+                UI_AdminMenu();
+                CurrentMode = MODE_ADMIN_MENU;
+                break;
+
+            /* ---------- é”å®š ---------- */
+            case MODE_LOCKED:
+                // å·²åœ¨å¤–éƒ¨æ£€æµ‹ï¼Œæ­¤å¤„å…œåº•
+                Do_LockedMode();
+                UI_MainMenu();
+                CurrentMode = MODE_MAIN_MENU;
+                break;
+
+            default:
+                CurrentMode = MODE_MAIN_MENU;
+                UI_MainMenu();
+                break;
         }
     }
 }
